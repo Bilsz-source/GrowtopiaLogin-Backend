@@ -18,11 +18,13 @@ const limiter = rateLimit({
   max: 50,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: false, xForwardedForHeader: false },
 });
 app.use(limiter);
 
 app.use(express.static(path.join(process.cwd(), 'public')));
 
+// logging
 app.use((req: Request, _res: Response, next: NextFunction) => {
   const clientIp =
     (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
@@ -35,14 +37,18 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 });
 
 app.get('/', (_req: Request, res: Response) => {
-  res.send('OK');
+  res.send('Hello, world!');
 });
 
+/**
+ * DASHBOARD
+ */
 app.all('/player/login/dashboard', async (req: Request, res: Response) => {
+  const body = req.body;
   let clientData = '';
 
-  if (req.body && Object.keys(req.body).length > 0) {
-    clientData = Object.keys(req.body)[0];
+  if (body && typeof body === 'object' && Object.keys(body).length > 0) {
+    clientData = Object.keys(body)[0];
   }
 
   const encodedClientData = Buffer.from(clientData).toString('base64');
@@ -57,59 +63,63 @@ app.all('/player/login/dashboard', async (req: Request, res: Response) => {
 });
 
 /**
- * 🔥 FIXED LOGIN / REGISTER HANDLER
+ * VALIDATE LOGIN / REGISTER
  */
 app.all('/player/growid/login/validate', async (req: Request, res: Response) => {
   try {
-    const body = req.body as Record<string, string>;
+    const formData = req.body as Record<string, string>;
 
-    const growId = (body.growId || '').trim();
-    const password = (body.password || '').trim();
-    const email = (body.email || '').trim();
-    const tokenInput = body._token || '';
-    const isRegister = body.reg === '1' || !!email;
+    const _token = formData._token || '';
+    const growId = (formData.growId || '').trim();
+    const password = (formData.password || '').trim();
+    const email = (formData.email || '').trim();
+    const isRegister = formData.reg === '1' || !!email;
 
-    console.log('[DEBUG BODY]', body);
+    console.log('[DEBUG]', { growId, password, email, isRegister });
 
-    // ✅ HARD VALIDATION LOGIN
-    if (!isRegister) {
+    let rawPayload = '';
+
+    /**
+     * ✅ REGISTER MODE (boleh kosong)
+     */
+    if (isRegister) {
+      rawPayload =
+        `tankIDName=${growId || ''}` +
+        `&tankIDPass=${password || ''}` +
+        `&email=${email || ''}` +
+        `&reg=1`;
+    } else {
+      /**
+       * ✅ LOGIN MODE (WAJIB VALID)
+       */
       if (!growId || !password) {
         return res.status(200).json({
           status: 'error',
-          message: 'GrowID / Password kosong',
+          message: 'Invalid credentials',
         });
       }
-    }
 
-    // ✅ BUILD PAYLOAD SESUAI FORMAT CLIENT
-    let rawPayload = '';
+      // sanitize basic
+      const safeGrowId = growId.replace(/[^A-Za-z0-9]/g, '');
+      const safePassword = password.replace(/[^A-Za-z0-9@._!\-]/g, '');
 
-    if (isRegister) {
       rawPayload =
-        `tankIDName=${growId}` +
-        `&tankIDPass=${password}` +
-        `&email=${email}` +
-        `&_token=${tokenInput}` +
-        `&reg=1`;
-    } else {
-      rawPayload =
-        `tankIDName=${growId}` +
-        `&tankIDPass=${password}` +
-        `&_token=${tokenInput}` +
+        `tankIDName=${safeGrowId}` +
+        `&tankIDPass=${safePassword}` +
         `&reg=0`;
     }
 
     const token = Buffer.from(rawPayload).toString('base64');
 
-    return res.status(200).json({
+    return res.json({
       status: 'success',
-      message: 'Account Validated',
+      message: 'Account Validated.',
       token,
       url: '',
       accountType: 'growtopia',
     });
-  } catch (err) {
-    console.log('[ERROR]', err);
+  } catch (error) {
+    console.log('[ERROR]', error);
     return res.status(500).json({
       status: 'error',
       message: 'Internal Server Error',
@@ -117,21 +127,37 @@ app.all('/player/growid/login/validate', async (req: Request, res: Response) => 
   }
 });
 
+/**
+ * CHECKTOKEN REDIRECT
+ */
 app.all('/player/growid/checktoken', async (_req: Request, res: Response) => {
   return res.redirect(307, '/player/growid/validate/checktoken');
 });
 
+/**
+ * VALIDATE CHECKTOKEN
+ */
 app.all('/player/growid/validate/checktoken', async (req: Request, res: Response) => {
   try {
+    let refreshToken: string | undefined;
+    let clientData: string | undefined;
+
     const formData = req.body as Record<string, string>;
 
-    let refreshToken = formData.refreshToken;
-    let clientData = formData.clientData;
+    if ('refreshToken' in formData || 'clientData' in formData) {
+      refreshToken = formData.refreshToken;
+      clientData = formData.clientData;
+    } else if (Object.keys(formData).length === 1) {
+      const rawPayload = Object.keys(formData)[0];
+      const params = new URLSearchParams(rawPayload);
+      refreshToken = params.get('refreshToken') || undefined;
+      clientData = params.get('clientData') || undefined;
+    }
 
     if (!refreshToken || !clientData) {
-      return res.status(200).json({
+      return res.json({
         status: 'error',
-        message: 'Missing token',
+        message: 'Missing refreshToken or clientData',
       });
     }
 
@@ -139,22 +165,24 @@ app.all('/player/growid/validate/checktoken', async (req: Request, res: Response
 
     decoded = decoded.replace('&reg=0', '').replace('&reg=1', '');
 
-    const newToken = Buffer.from(
+    const token = Buffer.from(
       decoded.replace(
         /(_token=)[^&]*/,
-        `$1${Buffer.from(clientData).toString('base64')}`
-      )
+        `$1${Buffer.from(clientData).toString('base64')}`,
+      ),
     ).toString('base64');
 
-    return res.status(200).json({
+    return res.json({
       status: 'success',
-      message: 'OK',
-      token: newToken,
+      message: 'Account Validated.',
+      token,
+      url: '',
       accountType: 'growtopia',
+      accountAge: 2,
     });
-  } catch (err) {
-    console.log('[ERROR]', err);
-    return res.status(200).json({
+  } catch (error) {
+    console.log('[ERROR]', error);
+    return res.json({
       status: 'error',
       message: 'Internal Server Error',
     });
@@ -162,7 +190,7 @@ app.all('/player/growid/validate/checktoken', async (req: Request, res: Response
 });
 
 app.listen(PORT, () => {
-  console.log(`[SERVER] http://localhost:${PORT}`);
+  console.log(`[SERVER] Running on http://localhost:${PORT}`);
 });
 
 export default app;
